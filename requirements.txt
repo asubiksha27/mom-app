@@ -1,0 +1,10 @@
+streamlit
+opencv-python-headless
+pytesseract
+git+https://github.com/openai/whisper.git
+moviepy
+torch
+transformers
+sentencepiece
+spacy
+reportlab
