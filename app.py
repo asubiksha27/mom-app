@@ -1,4 +1,4 @@
-import os, re, tempfile
+import os, re, json, tempfile
 from datetime import datetime
 from collections import defaultdict
 
@@ -6,8 +6,8 @@ import streamlit as st
 import whisper
 import spacy
 from transformers import pipeline
-from reportlab.lib.pagesizes import A4
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib import colors
 from reportlab.lib.units import mm
@@ -16,46 +16,44 @@ from reportlab.lib.units import mm
 MODEL_SIZE = "small"
 TIMELINE_SEGMENTS = 6
 
-# ---------------- LOAD NLP ----------------
-try:
-    nlp = spacy.load("en_core_web_sm")
-except:
-    import subprocess
-    subprocess.run(["python", "-m", "spacy", "download", "en_core_web_sm"])
-    nlp = spacy.load("en_core_web_sm")
+# ---------------- LOAD MODELS ----------------
+@st.cache_resource
+def load_whisper_model():
+    return whisper.load_model(MODEL_SIZE)
 
+@st.cache_resource
+def load_spacy_model():
+    return spacy.load("en_core_web_sm")
+
+@st.cache_resource
+def load_summarizer():
+    return pipeline("summarization", model="facebook/bart-large-cnn")
+
+whisper_model = load_whisper_model()
+nlp = load_spacy_model()
+summarizer = load_summarizer()
+
+# ---------------- HELPERS ----------------
 TASK_REGEX = r'(?:(?:To |Assign(ed to )?)?([A-Z][a-zA-Z]{1,30}))?.*?\b(submit|prepare|share|complete|send|deliver|provide|finalize)\b.*?\b(on|by)\b\s+([0-9]{1,2}[-/ ](?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec|[A-Za-z]+)[-/ ]\d{2,4}|[0-9]{1,2}[-/][0-9]{1,2}[-/][0-9]{2,4})'
 
-# ---------------- FUNCTIONS ----------------
-def transcribe_and_translate(audio_path, model_size="small"):
-    model = whisper.load_model(model_size)
-    result = model.transcribe(audio_path, verbose=False)
+def transcribe_and_translate(audio_path):
+    result = whisper_model.transcribe(audio_path, verbose=False)
     detected_lang = result.get("language", None)
     segments = result.get("segments", [])
     text = result.get("text", "").strip()
 
-    # Auto-translate if not English
+    # Translate if not English
     if detected_lang and detected_lang != "en":
-        translated = model.transcribe(audio_path, task="translate", verbose=False)
+        translated = whisper_model.transcribe(audio_path, task="translate", verbose=False)
         segments = translated.get("segments", segments)
         text = translated.get("text", text)
         detected_lang = "en"
 
-    return segments, detected_lang, text
-
-
-def extract_action_items(segments):
-    items = []
-    for seg in segments:
-        text = seg.get("text","").strip()
-        if not text: continue
-        m = re.search(TASK_REGEX, text, re.I)
-        if m:
-            assignee = m.group(2) or "Unassigned"
-            deadline = m.group(5) or ""
-            items.append((assignee, text, deadline))
-    return items
-
+    # Normalize
+    uniform = []
+    for s in segments:
+        uniform.append({"start": s.get("start",0.0), "end": s.get("end",0.0), "text": s.get("text","")})
+    return uniform, detected_lang, text
 
 def build_timeline(segments, max_rows=6):
     timeline = []
@@ -67,99 +65,114 @@ def build_timeline(segments, max_rows=6):
         timeline.append({"start":start, "end":end, "topic": topic})
     return timeline
 
+def extract_action_items(segments):
+    action_items = []
+    for seg in segments:
+        text = seg.get("text","").strip()
+        if not text: continue
+        m = re.search(TASK_REGEX, text, re.I)
+        if m:
+            assignee = m.group(2) or "Unassigned"
+            deadline = m.group(5) or ""
+            action_items.append((assignee, text, deadline))
+    return action_items
 
 def generate_summary(full_text):
     try:
-        summarizer = pipeline("summarization", model="facebook/bart-large-cnn")
-        out = summarizer(full_text, max_length=150, min_length=50, do_sample=False)
+        out = summarizer(full_text, max_length=400, min_length=100, do_sample=False)
         return out[0]["summary_text"]
-    except Exception as e:
+    except:
         return full_text
 
-
-def write_pdf(path, meeting_date, meeting_time, timeline, summary, action_items, dialogue):
+def write_mom_pdf(path, meeting_date, meeting_time, location, participants, timeline, summary, dialogue, action_items):
     doc = SimpleDocTemplate(path, pagesize=A4, rightMargin=10*mm, leftMargin=10*mm, topMargin=12*mm, bottomMargin=12*mm)
     styles = getSampleStyleSheet()
-    styles.add(ParagraphStyle(name='BodySmall', parent=styles['Normal'], fontSize=9, leading=11, alignment=0))
+    styles.add(ParagraphStyle(name='BodySmall', parent=styles['Normal'], fontSize=9, leading=11))
+
     story = []
 
+    # Header
     story.append(Paragraph("<b>Minutes of Meeting (MoM)</b>", styles['Heading2']))
     story.append(Spacer(1,6))
-
-    story.append(Paragraph(f"<b>Date:</b> {meeting_date}  |  <b>Time:</b> {meeting_time}", styles['BodySmall']))
+    meta = f"<b>Meeting Date:</b> {meeting_date} &nbsp;&nbsp; <b>Time:</b> {meeting_time} &nbsp;&nbsp; <b>Location:</b> {location}"
+    story.append(Paragraph(meta, styles['BodySmall']))
+    if participants:
+        story.append(Paragraph("<b>Participants:</b> " + ", ".join(participants), styles['BodySmall']))
     story.append(Spacer(1,6))
 
     # Timeline
     if timeline:
-        story.append(Paragraph("<b>Timeline</b>", styles['BodySmall']))
+        story.append(Paragraph("<b>Meeting Timeline</b>", styles['BodySmall']))
         table_data = [["Start","End","Topic"]]
         for row in timeline:
             def fmt(s): m = int(s//60); sec = int(s%60); return f"{m:02d}:{sec:02d}"
             table_data.append([fmt(row["start"]), fmt(row["end"]), row["topic"]])
-        table = Table(table_data, colWidths=[50,50,300])
+        table = Table(table_data, colWidths=[45,45,350])
         table.setStyle(TableStyle([("GRID",(0,0),(-1,-1),0.35,colors.black)]))
         story.append(table)
         story.append(Spacer(1,6))
 
     # Summary
-    story.append(Paragraph("<b>Summary</b>", styles['BodySmall']))
+    story.append(Paragraph("<b>Meeting Summary</b>", styles['BodySmall']))
     story.append(Paragraph(summary, styles['BodySmall']))
     story.append(Spacer(1,6))
 
-    # Action items
-    if action_items:
-        story.append(Paragraph("<b>Action Items</b>", styles['BodySmall']))
-        table_data = [["Assigned To","Task","Deadline"]] + list(action_items)
-        table = Table(table_data, colWidths=[100,250,100])
-        table.setStyle(TableStyle([("GRID",(0,0),(-1,-1),0.35,colors.black)]))
-        story.append(table)
-        story.append(Spacer(1,6))
-
-    # Dialogue
-    story.append(Paragraph("<b>Speaker Dialogue</b>", styles['BodySmall']))
+    # Speaker Dialogue
+    story.append(Paragraph("<b>Speaker-wise Dialogue</b>", styles['BodySmall']))
     for speaker, lines in dialogue.items():
         story.append(Paragraph(f"<b>{speaker}</b>", styles['BodySmall']))
         for l in lines:
             story.append(Paragraph(f"• {l}", styles['BodySmall']))
+    story.append(Spacer(1,6))
+
+    # Action Items
+    if action_items:
+        story.append(Paragraph("<b>Action Items</b>", styles['BodySmall']))
+        table_data = [["Assigned To","Task","Deadline"]] + action_items
+        table = Table(table_data, colWidths=[100,310,60])
+        table.setStyle(TableStyle([("GRID",(0,0),(-1,-1),0.35,colors.black)]))
+        story.append(table)
 
     doc.build(story)
 
-
 # ---------------- STREAMLIT APP ----------------
-st.title("🎙️ AI-Powered MoM Generator")
+st.title("📑 AI Minutes of Meeting (MoM) Generator")
 
-uploaded_file = st.file_uploader("Upload meeting audio (.mp3 / .wav)", type=["mp3","wav"])
-
-if uploaded_file is not None:
+uploaded_file = st.file_uploader("Upload a meeting audio", type=["mp3","wav"])
+if uploaded_file:
     with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
         tmp.write(uploaded_file.read())
         audio_path = tmp.name
 
-    st.info("⏳ Processing audio... please wait")
+    with st.spinner("Processing audio..."):
+        segments, lang, full_text = transcribe_and_translate(audio_path)
+        timeline = build_timeline(segments, max_rows=TIMELINE_SEGMENTS)
+        action_items = extract_action_items(segments)
 
-    segments, lang, full_text = transcribe_and_translate(audio_path, model_size=MODEL_SIZE)
+        # Simple participant + dialogue extraction
+        participants = []
+        dialogue = defaultdict(list)
+        for seg in segments:
+            text = seg["text"].strip()
+            speaker = "Unknown"
+            doc = nlp(text)
+            for ent in doc.ents:
+                if ent.label_ == "PERSON":
+                    speaker = ent.text
+                    break
+            participants.append(speaker)
+            dialogue[speaker].append(text)
 
-    timeline = build_timeline(segments, max_rows=TIMELINE_SEGMENTS)
-    action_items = extract_action_items(segments)
-    summary = generate_summary(full_text)
+        participants = list(set(participants))
+        summary = generate_summary(full_text)
 
-    # Simple dialogue grouping
-    dialogue = defaultdict(list)
-    for seg in segments:
-        dialogue["Speaker"].append(seg.get("text",""))
+        meeting_date = datetime.now().strftime("%d-%b-%Y")
+        meeting_time = "10:00 AM - 11:00 AM"
+        location = "Virtual"
 
-    st.subheader("📌 Summary")
-    st.write(summary)
+        pdf_path = "MoM_Output.pdf"
+        write_mom_pdf(pdf_path, meeting_date, meeting_time, location, participants, timeline, summary, dialogue, action_items)
 
-    st.subheader("✅ Action Items")
-    if action_items:
-        st.table(action_items)
-    else:
-        st.write("No clear action items detected.")
-
-    # Generate PDF
-    pdf_path = "MoM_Output.pdf"
-    write_pdf(pdf_path, datetime.now().strftime("%d-%b-%Y"), "10:00 AM - 11:00 AM", timeline, summary, action_items, dialogue)
-
+    st.success("✅ MoM generated successfully!")
     with open(pdf_path, "rb") as f:
-        st.download_button("📥 Download MoM PDF", f, file_name="MoM.pdf", mime="application/pdf")
+        st.download_button("📥 Download MoM PDF", f, file_name="meeting_minutes.pdf", mime="application/pdf")
