@@ -1,8 +1,7 @@
 streamlit
 openai-whisper
 torch==2.2.2
-transformers==4.36.2
-sentencepiece
 spacy==3.7.2
 https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.7.1/en_core_web_sm-3.7.1-py3-none-any.whl
 reportlab
+sumy
