@@ -23,10 +23,17 @@ def load_whisper_model():
 
 @st.cache_resource
 def load_spacy_model():
-    return spacy.load("en_core_web_sm")
+    """Load spaCy model with fallback download if missing"""
+    try:
+        return spacy.load("en_core_web_sm")
+    except OSError:
+        from spacy.cli import download
+        download("en_core_web_sm")
+        return spacy.load("en_core_web_sm")
 
 @st.cache_resource
 def load_summarizer():
+    # use lighter summarizer for faster deployment
     return pipeline("summarization", model="sshleifer/distilbart-cnn-12-6")
 
 whisper_model = load_whisper_model()
