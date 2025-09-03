@@ -5,7 +5,9 @@ from collections import defaultdict
 import streamlit as st
 import whisper
 import spacy
-from transformers import pipeline
+from sumy.parsers.plaintext import PlaintextParser
+from sumy.nlp.tokenizers import Tokenizer
+from sumy.summarizers.lsa import LsaSummarizer
 from reportlab.lib.pagesizes import A4
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -26,13 +28,15 @@ def load_whisper():
 def load_spacy():
     return spacy.load("en_core_web_sm")
 
-@st.cache_resource
-def load_summarizer():
-    return pipeline("summarization", model="facebook/bart-large-cnn")
-
 whisper_model = load_whisper()
 nlp = load_spacy()
-summarizer = load_summarizer()
+
+# ---------- Summarizer ----------
+def generate_summary(text, sentences_count=5):
+    parser = PlaintextParser.from_string(text, Tokenizer("english"))
+    summarizer = LsaSummarizer()
+    summary = summarizer(parser.document, sentences_count)
+    return " ".join(str(sentence) for sentence in summary)
 
 # ---------- Transcription ----------
 def transcribe_and_translate_if_needed(audio_path):
@@ -62,7 +66,7 @@ def transcribe_and_translate_if_needed(audio_path):
     return uniform, detected_lang, full_text
 
 # ---------- Key-point extraction ----------
-TASK_REGEX = r'(?:(?:To |Assign(ed to )?)?([A-Z][a-zA-Z]{1,30}))?.*?\b(submit|prepare|share|complete|send|deliver|provide|finalize)\b.*?\b(on|by)\b\s+([0-9]{1,2}[-/ ](?:Jan|Feb|Mar|...|Dec|[A-Za-z]+)[-/ ]\d{2,4}|[0-9]{1,2}[-/][0-9]{1,2}[-/][0-9]{2,4})'
+TASK_REGEX = r'(?:(?:To |Assign(ed to )?)?([A-Z][a-zA-Z]{1,30}))?.*?\b(submit|prepare|share|complete|send|deliver|provide|finalize)\b.*?\b(on|by)\b\s+([0-9]{1,2}[-/ ](?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec|[A-Za-z]+)[-/ ]\d{2,4}|[0-9]{1,2}[-/][0-9]{1,2}[-/][0-9]{2,4})'
 
 def extract_key_points_with_deadlines(segments):
     action_items = []
@@ -192,11 +196,7 @@ if uploaded_file:
 
     # Generate summary
     with st.spinner("Summarizing..."):
-        try:
-            out = summarizer(full_text, max_length=500, min_length=120, do_sample=False)
-            summary_text = out[0]["summary_text"]
-        except:
-            summary_text = full_text
+        summary_text = generate_summary(full_text, sentences_count=5)
 
     st.subheader("Meeting Summary")
     st.write(summary_text)
