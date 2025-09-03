@@ -1,11 +1,10 @@
-import os, re, json, tempfile
+import os, re, tempfile
 from datetime import datetime
 from collections import defaultdict
 
 import streamlit as st
 import whisper
 import spacy
-import en_core_web_sm
 from transformers import pipeline
 from reportlab.lib.pagesizes import A4
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
@@ -14,7 +13,7 @@ from reportlab.lib import colors
 from reportlab.lib.units import mm
 
 # ---------------- CONFIG ----------------
-MODEL_SIZE = "small"
+MODEL_SIZE = "tiny"   # use "tiny" for faster Streamlit Cloud inference
 TIMELINE_SEGMENTS = 6
 
 # ---------------- LOAD MODELS ----------------
@@ -24,11 +23,12 @@ def load_whisper_model():
 
 @st.cache_resource
 def load_spacy_model():
-    return en_core_web_sm.load()
+    return spacy.load("en_core_web_sm")
 
 @st.cache_resource
 def load_summarizer():
-    return pipeline("summarization", model="facebook/bart-large-cnn")
+    # use lighter summarizer for faster deployment
+    return pipeline("summarization", model="sshleifer/distilbart-cnn-12-6")
 
 whisper_model = load_whisper_model()
 nlp = load_spacy_model()
@@ -65,6 +65,7 @@ def transcribe_and_translate_if_needed(audio_path):
 
     return segments, detected_lang, full_text
 
+
 TASK_REGEX = r'(?:(?:To |Assign(ed to )?)?([A-Z][a-zA-Z]{1,30}))?.*?\b(submit|prepare|share|complete|send|deliver|provide|finalize)\b.*?\b(on|by)\b\s+([0-9]{1,2}[-/ ](?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec|[A-Za-z]+)[-/ ]\d{2,4}|[0-9]{1,2}[-/][0-9]{1,2}[-/][0-9]{2,4})'
 
 def extract_key_points_with_deadlines(segments):
@@ -83,6 +84,7 @@ def extract_key_points_with_deadlines(segments):
                 action_items.append((assignee, s, deadline))
     return action_items
 
+
 def build_timeline(segments, max_rows=6):
     timeline = []
     for seg in segments[:max_rows]:
@@ -91,6 +93,7 @@ def build_timeline(segments, max_rows=6):
         topic = (text.split(".")[0])[:80] if text else ""
         timeline.append({"start":start, "end":end, "topic": topic})
     return timeline
+
 
 def write_mom_pdf(path, meeting_date, meeting_time, location, participants, timeline, summary_text, speaker_dialogue, action_items):
     doc = SimpleDocTemplate(path, pagesize=A4, rightMargin=10*mm, leftMargin=10*mm, topMargin=12*mm, bottomMargin=12*mm)
@@ -159,12 +162,14 @@ def write_mom_pdf(path, meeting_date, meeting_time, location, participants, time
 
     doc.build(story)
 
+
 def generate_summary(full_text):
     try:
         out = summarizer(full_text, max_length=200, min_length=60, do_sample=False)
         return out[0]["summary_text"]
-    except Exception as e:
+    except Exception:
         return full_text
+
 
 def generate_mom_from_audio_file(audio_file):
     base = os.path.splitext(os.path.basename(audio_file))[0]
@@ -196,6 +201,7 @@ def generate_mom_from_audio_file(audio_file):
         pdf_path = base + "_MoM.pdf"
         write_mom_pdf(pdf_path, meeting_date, meeting_time, location, participants, timeline, summary_text, speaker_dialogue, action_items)
         return pdf_path
+
 
 # ---------------- STREAMLIT UI ----------------
 st.title("📑 AI Minutes of Meeting (MoM) Generator")
