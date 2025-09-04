@@ -1,8 +1,8 @@
-import streamlit as st
 import os, re, json, tempfile
 from datetime import datetime
 from collections import defaultdict, Counter
 
+import streamlit as st
 from moviepy.editor import VideoFileClip
 import cv2
 import pytesseract
@@ -19,6 +19,15 @@ from reportlab.lib.units import mm
 MODEL_SIZE = "small"          # tiny/base/small/medium
 OCR_INTERVAL_SEC = 4
 TIMELINE_SEGMENTS = 6
+
+# ---------------- SAFE SPACY LOAD ----------------
+try:
+    nlp = spacy.load("en_core_web_sm")
+except OSError:
+    from spacy.cli import download
+    st.info("📥 Downloading spaCy model... please wait ⏳")
+    download("en_core_web_sm")
+    nlp = spacy.load("en_core_web_sm")
 
 # ---------------- HELPERS ----------------
 def safe_extract_audio(video_path, audio_path):
@@ -83,14 +92,12 @@ def transcribe_and_translate_if_needed(audio_path, model_size="small"):
                 segments = [{"start":0.0,"end":0.0,"text":full_text}] if full_text else segments
             detected_lang = "en"
         except Exception as e:
-            print("[!] Translation failed:", e)
+            st.warning(f"[!] Translation failed: {e}")
     uniform = []
     for s in segments:
         uniform.append({"start": s.get("start",0.0), "end": s.get("end",0.0), "text": s.get("text","")})
     return uniform, detected_lang, full_text
 
-# ---------------- NLP & TASK EXTRACTION ----------------
-nlp = spacy.load("en_core_web_sm")
 TASK_REGEX = r'(?:(?:To |Assign(ed to )?)?([A-Z][a-zA-Z]{1,30}))?.*?\b(submit|prepare|share|complete|send|deliver|provide|finalize)\b.*?\b(on|by)\b\s+([0-9]{1,2}[-/ ](?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec|[A-Za-z]+)[-/ ]\d{2,4}|[0-9]{1,2}[-/][0-9]{1,2}[-/][0-9]{2,4})'
 
 def extract_key_points_with_deadlines(segments):
@@ -118,7 +125,6 @@ def build_timeline(segments, max_rows=6):
         timeline.append({"start":start, "end":end, "topic": topic})
     return timeline
 
-# ---------------- PDF GENERATOR ----------------
 def write_mom_pdf(path, meeting_date, meeting_time, location, participants, timeline, summary_text, speaker_dialogue, action_items):
     doc = SimpleDocTemplate(path, pagesize=A4, rightMargin=10*mm, leftMargin=10*mm, topMargin=12*mm, bottomMargin=12*mm)
     styles = getSampleStyleSheet()
@@ -135,8 +141,8 @@ def write_mom_pdf(path, meeting_date, meeting_time, location, participants, time
     story.append(Spacer(1,6))
 
     # Timeline
-    story.append(Paragraph("<b>Meeting Timeline</b>", styles['BodySmall']))
     if timeline:
+        story.append(Paragraph("<b>Meeting Timeline</b>", styles['BodySmall']))
         table_data = [["Start","End","Topic"]]
         for row in timeline:
             def fmt(s): m = int(s//60); sec = int(s%60); return f"{m:02d}:{sec:02d}"
@@ -151,7 +157,7 @@ def write_mom_pdf(path, meeting_date, meeting_time, location, participants, time
             ("FONTSIZE",(0,0),(-1,-1),8)
         ]))
         story.append(table)
-    story.append(Spacer(1,6))
+        story.append(Spacer(1,6))
 
     # Short Summary
     story.append(Paragraph("<b>Meeting Summary</b>", styles['BodySmall']))
@@ -176,7 +182,7 @@ def write_mom_pdf(path, meeting_date, meeting_time, location, participants, time
         story.append(table)
         story.append(Spacer(1,6))
 
-    # Speaker-wise dialogue
+    # Speaker dialogue
     story.append(Paragraph("<b>Speaker-wise Dialogue</b>", styles['BodySmall']))
     for speaker in sorted(speaker_dialogue.keys()):
         lines = speaker_dialogue[speaker]
@@ -186,97 +192,82 @@ def write_mom_pdf(path, meeting_date, meeting_time, location, participants, time
 
     doc.build(story)
 
-# ---------------- SHORT SUMMARY ----------------
 def generate_short_summary(full_text):
     try:
         summarizer = pipeline("summarization", model="facebook/bart-large-cnn", device=-1)
         out = summarizer(full_text, max_length=150, min_length=50, do_sample=False)
         return out[0]["summary_text"]
     except Exception as e:
-        print("[!] Summarization failed:", e)
+        st.warning(f"[!] Summarization failed: {e}")
         return full_text
 
-# ---------------- MAIN FUNCTION ----------------
-def generate_mom_from_video_file(video_file, model_size=MODEL_SIZE, ocr_interval_sec=OCR_INTERVAL_SEC):
-    base = os.path.splitext(os.path.basename(video_file))[0]
-    with tempfile.TemporaryDirectory() as td:
-        audio_path = os.path.join(td, "audio.wav")
-        safe_extract_audio(video_file, audio_path)
-        visual_names = extract_visual_names_from_video(video_file, interval_sec=ocr_interval_sec)
-        segments, detected_lang, full_text = transcribe_and_translate_if_needed(audio_path, model_size=model_size)
-
-        timeline = build_timeline(segments, max_rows=TIMELINE_SEGMENTS)
-        action_items = extract_key_points_with_deadlines(segments)
-
-        # Speaker-wise dialogue
-        speaker_dialogue = defaultdict(list)
-        participants = list(visual_names)
-        for seg in segments:
-            text = seg.get("text","").strip()
-            assigned = None
-            doc = nlp(text)
-            for ent in doc.ents:
-                if ent.label_ == "PERSON":
-                    assigned = ent.text
-                    break
-            if not assigned:
-                for vn in visual_names:
-                    if vn.lower() in text.lower():
-                        assigned = vn
-                        break
-            if not assigned:
-                assigned = "Unknown"
-            speaker_dialogue[assigned].append(text)
-            if assigned not in participants:
-                participants.append(assigned)
-
-        summary_text = generate_short_summary(full_text)
-
-        # heuristics for meeting date/time/location
-        date_match = re.search(r'(\b\d{1,2}[-/ ](?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec|[A-Za-z]+)[-/ ]\d{2,4}\b)', full_text, re.I)
-        meeting_date = date_match.group(1) if date_match else datetime.now().strftime("%d-%b-%Y")
-        time_match = re.search(r'(\b\d{1,2}[:.]\d{2}\s*(?:AM|PM|am|pm)?)', full_text)
-        meeting_time = time_match.group(1) + " - " + (time_match.group(1) if time_match else "Unknown") if time_match else "10:00 AM - 11:00 AM"
-        location = "Virtual (Zoom)" if re.search(r'\bzoom|teams|meet|virtual\b', full_text, re.I) else "Virtual"
-
-        pdf_path = base + "_MoM.pdf"
-        write_mom_pdf(pdf_path,
-                      meeting_date=meeting_date,
-                      meeting_time=meeting_time,
-                      location=location,
-                      participants=participants,
-                      timeline=timeline,
-                      summary_text=summary_text,
-                      speaker_dialogue=speaker_dialogue,
-                      action_items=action_items)
-
-        txt_path = base + "_MoM_debug.txt"
-        with open(txt_path, "w", encoding="utf-8") as f:
-            f.write("Detected visual names:\n" + json.dumps(visual_names, indent=2, ensure_ascii=False) + "\n\n")
-            f.write("Action items:\n" + json.dumps(action_items, indent=2, ensure_ascii=False) + "\n\n")
-            f.write("Speaker dialogue:\n" + json.dumps(speaker_dialogue, indent=2, ensure_ascii=False) + "\n\n")
-            f.write("Timeline segments (first 30):\n")
-            for s in segments[:30]:
-                f.write(f"[{s.get('start')} - {s.get('end')}] {s.get('text')}\n\n")
-
-        return {"pdf": pdf_path, "txt": txt_path}
-
 # ---------------- STREAMLIT APP ----------------
-st.title("🎥 AI Minutes of Meeting (MoM) Generator")
+st.title("📋 AI Minutes of Meeting (MoM) Generator")
+uploaded_file = st.file_uploader("Upload a meeting video", type=["mp4","mkv","avi","mov"])
 
-uploaded_file = st.file_uploader("Upload a meeting video (mp4/mkv/mov)", type=["mp4","mkv","mov"])
 if uploaded_file is not None:
     with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
         tmp.write(uploaded_file.read())
-        tmp_path = tmp.name
+        video_path = tmp.name
 
-    st.info("Processing video... This may take some time ⏳")
-    result = generate_mom_from_video_file(tmp_path)
+    with st.spinner("⏳ Processing video... this may take a while"):
+        try:
+            base = os.path.splitext(os.path.basename(video_path))[0]
+            with tempfile.TemporaryDirectory() as td:
+                audio_path = os.path.join(td, "audio.wav")
+                safe_extract_audio(video_path, audio_path)
 
-    st.success("✅ MoM generated successfully!")
+                visual_names = extract_visual_names_from_video(video_path, interval_sec=OCR_INTERVAL_SEC)
+                segments, detected_lang, full_text = transcribe_and_translate_if_needed(audio_path, model_size=MODEL_SIZE)
 
-    with open(result["pdf"], "rb") as f:
-        st.download_button("📥 Download MoM PDF", f, file_name=os.path.basename(result["pdf"]))
+                timeline = build_timeline(segments, max_rows=TIMELINE_SEGMENTS)
+                action_items = extract_key_points_with_deadlines(segments)
 
-    with open(result["txt"], "rb") as f:
-        st.download_button("📥 Download Debug TXT", f, file_name=os.path.basename(result["txt"]))
+                # Speaker-wise dialogue
+                speaker_dialogue = defaultdict(list)
+                participants = list(visual_names)
+                for seg in segments:
+                    text = seg.get("text","").strip()
+                    assigned = None
+                    doc = nlp(text)
+                    for ent in doc.ents:
+                        if ent.label_ == "PERSON":
+                            assigned = ent.text
+                            break
+                    if not assigned:
+                        for vn in visual_names:
+                            if vn.lower() in text.lower():
+                                assigned = vn
+                                break
+                    if not assigned:
+                        assigned = "Unknown"
+                    speaker_dialogue[assigned].append(text)
+                    if assigned not in participants:
+                        participants.append(assigned)
+
+                summary_text = generate_short_summary(full_text)
+
+                # heuristics for meeting date/time/location
+                date_match = re.search(r'(\b\d{1,2}[-/ ](?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec|[A-Za-z]+)[-/ ]\d{2,4}\b)', full_text, re.I)
+                meeting_date = date_match.group(1) if date_match else datetime.now().strftime("%d-%b-%Y")
+                time_match = re.search(r'(\b\d{1,2}[:.]\d{2}\s*(?:AM|PM|am|pm)?)', full_text)
+                meeting_time = time_match.group(1) + " - " + (time_match.group(1) if time_match else "Unknown") if time_match else "10:00 AM - 11:00 AM"
+                location = "Virtual (Zoom)" if re.search(r'\bzoom|teams|meet|virtual\b', full_text, re.I) else "Virtual"
+
+                pdf_path = base + "_MoM.pdf"
+                write_mom_pdf(pdf_path,
+                            meeting_date=meeting_date,
+                            meeting_time=meeting_time,
+                            location=location,
+                            participants=participants,
+                            timeline=timeline,
+                            summary_text=summary_text,
+                            speaker_dialogue=speaker_dialogue,
+                            action_items=action_items)
+
+                st.success("✅ MoM Generated Successfully!")
+                with open(pdf_path, "rb") as f:
+                    st.download_button("📥 Download MoM PDF", f, file_name=pdf_path, mime="application/pdf")
+
+        except Exception as e:
+            st.error(f"❌ Error: {e}")
