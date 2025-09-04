@@ -1,8 +1,10 @@
-streamlit==1.38.0
-openai-whisper==20231117
-spacy==3.7.2
-transformers==4.44.2
-torch==2.1.2
-sentencepiece
+streamlit
+opencv-python-headless
+pytesseract
+moviepy
+git+https://github.com/openai/whisper.git
 reportlab
-ffmpeg-python
+transformers
+sentencepiece
+torch
+spacy
